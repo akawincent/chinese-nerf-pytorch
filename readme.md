@@ -69,10 +69,14 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     depth_map = torch.sum(weights * z_vals, -1)
     # 得到视差图
     disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
-    # 累加权重
+    # 累加权重 实际上就是渲染后RGBA图像的A不透明度
     acc_map = torch.sum(weights, -1)
 
+    # 如果渲染后背景为白色
     if white_bkgd:
+        # RGBA图像绘制到背景图的公式 (RGB)*A + 背景RGB - A
+        # 因为背景是白色的  所以背景RGB为1 
+        # 因为渲染得到的rgb_map是weights * 空间点的rgb得到的 所以已经乘过了acc_map[...,None] 因此第一项只有rgb_map
         rgb_map = rgb_map + (1.-acc_map[...,None])
 
     return rgb_map, disp_map, acc_map, weights, depth_map
