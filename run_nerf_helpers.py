@@ -6,8 +6,11 @@ import numpy as np
 
 
 # Misc
+# 计算均方误差的匿名函数
 img2mse = lambda x, y : torch.mean((x - y) ** 2)
+# 将均方误差转换为信噪比
 mse2psnr = lambda x : -10. * torch.log(x) / torch.log(torch.Tensor([10.]))
+# 将图像的数据类型转换到8bit形式 也就是说像素值范围为[0,255]
 to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
 
 
@@ -202,6 +205,8 @@ def get_rays(H, W, K, c2w):
     rays_o = c2w[:3,-1].expand(rays_d.shape)
     return rays_o, rays_d
 
+
+
 ############### 生成一个视角下每个像素对应的光线方向 ###############
 # parameters:
 #       H: 该视角下图像的高
@@ -253,6 +258,13 @@ def ndc_rays(H, W, focal, near, rays_o, rays_d):
 
 
 # Hierarchical sampling (section 5.2)
+############### 根据粗网络计算得出的weights完成精细网络的空间点采样 ###############
+# parameters:
+#       bins: 粗网络采样点在相机坐标系Z轴上各个点之间的中点
+#       weights: 粗网络计算得到的权重
+#       N_samples: 粗网络的采样数
+# returns:
+#       samples: 新生成的空间采样点，weights越大采样的新空间点越多，后续送入精细网络
 def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
     # Get pdf
     weights = weights + 1e-5 # prevent nans
@@ -282,20 +294,27 @@ def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
         u = torch.Tensor(u)
 
     # Invert CDF
+    # 把tensor变成内存连续存储的形式
     u = u.contiguous()
+    # searchsorted返回cdf中大于u的元素的数组索引 大小同u一样[batch_rays_size,N_samples]
     inds = torch.searchsorted(cdf, u, right=True)
+    # 获得(inds-1) 如果其中有元素减1后小于0 那就限制它只能为0
     below = torch.max(torch.zeros_like(inds-1), inds-1)
+    # inds是索引 限制inds的大小不能超过cdf的最大索引
     above = torch.min((cdf.shape[-1]-1) * torch.ones_like(inds), inds)
-    inds_g = torch.stack([below, above], -1)  # (batch, N_samples, 2)
+    # inds_g的大小(batch, N_samples, 2)
+    inds_g = torch.stack([below, above], -1) 
 
-    # cdf_g = tf.gather(cdf, inds_g, axis=-1, batch_dims=len(inds_g.shape)-2)
-    # bins_g = tf.gather(bins, inds_g, axis=-1, batch_dims=len(inds_g.shape)-2)
+    # matched_shape = [batch,N_samples,len(bins)]
     matched_shape = [inds_g.shape[0], inds_g.shape[1], cdf.shape[-1]]
     cdf_g = torch.gather(cdf.unsqueeze(1).expand(matched_shape), 2, inds_g)
     bins_g = torch.gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g)
 
     denom = (cdf_g[...,1]-cdf_g[...,0])
     denom = torch.where(denom<1e-5, torch.ones_like(denom), denom)
+
+    # 通过在均匀分布上采样 然后经过逆变换到cdf 就可以完成再weights这个分段函数上进行采样
+    # 达到的效果就是在weights值大的z轴上采样更多空间点
     t = (u-cdf_g[...,0])/denom
     samples = bins_g[...,0] + t * (bins_g[...,1]-bins_g[...,0])
 
