@@ -78,18 +78,19 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
 # 		chunk: 并行处理数量
 # 		**kwargs: 训练时的配置
 # returns；
-# 		
+# 		all_ret: 所有batch的光线渲染后的结果
 def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     """Render rays in smaller minibatches to avoid OOM.
     """
     all_ret = {}
     for i in range(0, rays_flat.shape[0], chunk):
+        # 对光线ray_flat执行具体的渲染后得到的结果
         ret = render_rays(rays_flat[i:i+chunk], **kwargs)
         for k in ret:
             if k not in all_ret:
                 all_ret[k] = []
             all_ret[k].append(ret[k])
-
+    # 得到所有batch的光线渲染后的结果
     all_ret = {k : torch.cat(all_ret[k], 0) for k in all_ret}
     return all_ret
 
@@ -110,6 +111,10 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
 # 		c2w_staticcam: 固定的相机位姿来生成对应的光线
 # 		**kwargs: 训练时的配置
 # returns:
+#       rgb_map: [batch_size, 3]. Predicted RGB values for rays.
+#       disp_map: [batch_size]. Disparity map. Inverse of depth.
+#       acc_map: [batch_size]. Accumulated opacity (alpha) along a ray.
+#       extras: dict with everything returned by render_rays().
 def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
                   near=0., far=1.,
                   use_viewdirs=False, c2w_staticcam=None,
@@ -411,10 +416,17 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
 
 ##################### 在光线上进行分层采样策略并执行体渲染的具体数学过程 #####################
 # parameters:
-# 		ray_batch:
-# 		network_fn:
-# 		network_quert_fn:
+# 		ray_batch: 一个batch中光线的相关信息,其中包含光线起点 光线方向 视角方向  光线远端 光线近端
+# 		network_fn: 粗网络
+# 		network_quert_fn: 执行网络前向传递操作的匿名函数
 # 		N_samples: 每条rays上采样的coarse样本数量
+#       N_importance: 每条rays上采样的fine样本数量
+#       network_fine: 精细网络
+#       white_bkgd: 数据集图像是否为白色背景
+#       raw_noise_std: 加入在体密度上高斯噪声的方差
+# returns:
+#       ret: rgb_map: 精细网络得到的空间点RGB sigma最终渲染输出的图像 
+#            rgb0: 粗网络得到的空间点RGB sigma渲染输出的图像
 def render_rays(ray_batch,
                 network_fn,
                 network_query_fn,
@@ -502,25 +514,27 @@ def render_rays(ray_batch,
 #     raw = run_network(pts)
 	# 将采样的空间点和方向向量输入到粗网络中进行前向处理 得到每个空间点的density以及不同观察方向的RGB值
     raw = network_query_fn(pts, viewdirs, network_fn)
-    # 对离散点的RGB和体密度进行体渲染得到图像上的颜色
+    # 对粗网络的离散点的RGB和体密度进行体渲染得到图像上的颜色
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
 	# 分层采样中的细采样环节
     if N_importance > 0:
-
+        # 保存粗网络的渲染结果
         rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
 
         z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
+        # 新的采样点 在相机坐标系z轴上的分布距离
         z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
         z_samples = z_samples.detach()
-
+        # 将粗网络的采样点和精细网络的采样点合并在一起
         z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
+        # 新的空间点(世界坐标系)
         pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
 
+        # 运行精细网络的前向处理 得到了每个空间点的RGB和体密度
         run_fn = network_fn if network_fine is None else network_fine
-#         raw = run_network(pts, fn=run_fn)
         raw = network_query_fn(pts, viewdirs, run_fn)
-
+        # 对精细网络的离散点的RGB和体密度进行体渲染得到图像上的颜色
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
     ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map}
@@ -530,12 +544,13 @@ def render_rays(ray_batch,
         ret['rgb0'] = rgb_map_0
         ret['disp0'] = disp_map_0
         ret['acc0'] = acc_map_0
+        # 计算每条射线上采样点分布的方差
         ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
 
     for k in ret:
         if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
             print(f"! [Numerical Error] {k} contains nan or inf.")
-
+    # 返回结果
     return ret
 
 
@@ -761,6 +776,7 @@ def train():
 		# 将RGBA图像转换成RGB图像
         if args.white_bkgd:
             # 使用白色背景
+            # 将RGBA原图绘制在背景上的公式为：原图RGB * A + 背景RGB * (1-A)
             images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
         else:
             images = images[...,:3]
@@ -962,7 +978,7 @@ def train():
                 coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
 
 				############# 像素坐标 光线起点 光线方向 像素RGB值 这些都是一一对应的 #############
-                # 从所有的像素中选取N_rand大小的batch
+                # 从所有的像素(Groundtruth)中选取N_rand大小的batch
                 select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
                 # 得到这个batch的像素坐标
                 select_coords = coords[select_inds].long()  # (N_rand, 2)
@@ -972,30 +988,35 @@ def train():
                 rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
                 # 将光线起点和光线方向组合在一起
                 batch_rays = torch.stack([rays_o, rays_d], 0)
-                # 得到这个batch的像素RGB值
+                # 得到这个batch的像素RGB值 Groundtruth
                 target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
         #####  Core optimization loop  #####
+        # 渲染！
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
 
         optimizer.zero_grad()
+        # 计算渲染得到的rgb与训练集target_s Grondtruth之间的损失
         img_loss = img2mse(rgb, target_s)
         trans = extras['raw'][...,-1]
         loss = img_loss
         psnr = mse2psnr(img_loss)
 
+        # 把粗网络的损失也加入到损失列表中
         if 'rgb0' in extras:
             img_loss0 = img2mse(extras['rgb0'], target_s)
             loss = loss + img_loss0
             psnr0 = mse2psnr(img_loss0)
 
+        # 同时优化粗网络和精细网络
         loss.backward()
         optimizer.step()
 
         # NOTE: IMPORTANT!
         ###   update learning rate   ###
+        # 调整Adam优化算法的参数
         decay_rate = 0.1
         decay_steps = args.lrate_decay * 1000
         new_lrate = args.lrate * (decay_rate ** (global_step / decay_steps))
@@ -1087,7 +1108,7 @@ def train():
                         tf.contrib.summary.image('disp0', extras['disp0'][tf.newaxis,...,tf.newaxis])
                         tf.contrib.summary.image('z_std', extras['z_std'][tf.newaxis,...,tf.newaxis])
         """
-
+        # 迭代步数前进一次
         global_step += 1
 
 
