@@ -31,7 +31,7 @@ rot_theta = lambda th : torch.Tensor([
 # parameters:
 #       theta: 仰角
 #       phi: 方位角
-#       radius: 球体半径 到球心的距离
+#       radius: 球体半径 到球心的距离(相机坐标系下)
 # returns:
 #       c2w: 生成的一系列相机位姿 共40个4x4变换矩阵
 def pose_spherical(theta, phi, radius):
